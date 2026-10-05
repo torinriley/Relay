@@ -16,7 +16,7 @@ sequenceDiagram
     S->>D: INSERT transaction
     S-->>P: job_id
     W->>S: lease(queues, capacity slot)
-    S->>D: BEGIN IMMEDIATE; promote/expire; select; fence
+    S->>D: BEGIN IMMEDIATE, promote or expire, select and fence
     S-->>W: job + lease_token
     loop long-running work
       W->>S: renew(job, token)
