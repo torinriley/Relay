@@ -20,7 +20,7 @@ SQLite supplies durable, crash-consistent transactions without outsourcing queue
 
 ## Priority aging
 
-Strict priority can starve low work. Weighted round-robin needs persistent per-queue scheduler state. Aging has no extra state and eventually promotes every waiting job, though its exact high-priority share is workload-dependent.
+Strict priority can starve low work. Weighted round-robin needs persistent per-queue scheduler state. Aging has no extra state and eventually promotes every waiting job, though its exact high-priority share is workload-dependent. To avoid an O(n) computed sort per claim, Relay reads one indexed candidate per priority class and computes effective priority across those four candidates.
 
 ## Bounded resources
 

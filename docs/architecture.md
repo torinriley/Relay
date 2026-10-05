@@ -37,7 +37,7 @@ TCP connections and worker tasks are bounded. Workers acquire a semaphore permit
 
 ## Scheduler
 
-Delayed and retrying rows become ready after `available_at_ms`. The 250 ms sweeper reduces idle latency; every lease transaction also promotes eligible rows and expires leases, so correctness does not depend on the background task. Selection orders by an aged priority and then creation time.
+Delayed and retrying rows become ready after `available_at_ms`. The 250 ms sweeper reduces idle latency; every lease transaction also promotes eligible rows and expires leases, so correctness does not depend on the background task. A partial index returns the oldest ready candidate in each of the four priority classes. Relay applies aging to those four candidates and selects the highest effective priority, then the oldest creation time. This preserves starvation resistance without sorting the whole ready set on every claim.
 
 ## Invariants
 
@@ -47,6 +47,8 @@ Delayed and retrying rows become ready after `available_at_ms`. The 250 ms sweep
 4. Terminal jobs are absent from scheduler queries.
 5. A job is removed only by an explicit dead purge.
 
+Persisted payloads, states, priorities, retry policies, attempt counts, and lease-field combinations are decoded and validated strictly. Invalid persisted data returns `StoreError::Corruption`; it is never silently replaced with a default state or payload.
+
 ## Shutdown
 
-SIGINT stops accepting work, signals background tasks, and waits up to five seconds for them. Client connections are independent tasks and OS closure handles stragglers. Workers stop claiming, allow their currently spawned jobs a brief drain, and then exit; unfinished leases are recovered by expiry. A future release should expose a configurable full worker drain timeout.
+SIGINT stops the worker from claiming new jobs and starts a configurable bounded drain (30 seconds by default). In-flight jobs keep renewing their leases and send their final ACK or failure before exit. At the deadline, remaining tasks are aborted and their leases are left for expiry recovery. The server stops accepting connections, signals background tasks, flushes committed SQLite work, and exits.

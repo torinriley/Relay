@@ -31,6 +31,8 @@ enum Command {
         metrics_address: String,
         #[arg(long, default_value_t = 1024)]
         max_connections: usize,
+        #[arg(long, default_value_t = 5_000)]
+        shutdown_timeout_ms: u64,
     },
     Worker {
         #[arg(short, long, required = true)]
@@ -43,6 +45,8 @@ enum Command {
         lease_ms: u64,
         #[arg(long, default_value_t = 100)]
         poll_ms: u64,
+        #[arg(long, default_value_t = 30_000)]
+        shutdown_timeout_ms: u64,
     },
     Submit(SubmitArgs),
     Inspect {
@@ -106,11 +110,13 @@ async fn main() -> Result<()> {
             db,
             metrics_address,
             max_connections,
+            shutdown_timeout_ms,
         } => {
             let config = ServerConfig {
                 listen: cli.address.parse().context("invalid listen address")?,
                 metrics_listen: metrics_address.parse().context("invalid metrics address")?,
                 max_connections,
+                shutdown_timeout: std::time::Duration::from_millis(shutdown_timeout_ms),
             };
             relay::run_server(Store::open(db)?, config).await?;
         }
@@ -120,10 +126,20 @@ async fn main() -> Result<()> {
             worker_id,
             lease_ms,
             poll_ms,
+            shutdown_timeout_ms,
         } => {
             let id =
                 worker_id.unwrap_or_else(|| format!("worker_{}", uuid::Uuid::new_v4().simple()));
-            run_worker(cli.address, id, queue, concurrency, lease_ms, poll_ms).await?;
+            run_worker(
+                cli.address,
+                id,
+                queue,
+                concurrency,
+                lease_ms,
+                poll_ms,
+                shutdown_timeout_ms,
+            )
+            .await?;
         }
         Command::Submit(a) => {
             let payload = serde_json::from_str(&a.payload).context("payload must be valid JSON")?;

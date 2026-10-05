@@ -23,14 +23,14 @@ impl JobState {
 
 impl fmt::Display for JobState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{}",
-            serde_json::to_value(self)
-                .expect("enum serializes")
-                .as_str()
-                .expect("enum is string")
-        )
+        f.write_str(match self {
+            Self::Pending => "pending",
+            Self::Ready => "ready",
+            Self::Leased => "leased",
+            Self::Succeeded => "succeeded",
+            Self::Retrying => "retrying",
+            Self::Dead => "dead",
+        })
     }
 }
 
@@ -61,12 +61,13 @@ impl Priority {
             Self::Critical => 3,
         }
     }
-    pub fn from_value(value: i64) -> Self {
+    pub fn try_from_value(value: i64) -> Result<Self, String> {
         match value {
-            0 => Self::Low,
-            2 => Self::High,
-            3 => Self::Critical,
-            _ => Self::Normal,
+            0 => Ok(Self::Low),
+            1 => Ok(Self::Normal),
+            2 => Ok(Self::High),
+            3 => Ok(Self::Critical),
+            _ => Err(format!("invalid priority value: {value}")),
         }
     }
 }

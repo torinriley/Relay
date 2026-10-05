@@ -5,7 +5,10 @@ use crate::Client;
 use anyhow::Result;
 use serde_json::Value;
 use std::{sync::Arc, time::Duration};
-use tokio::sync::{watch, Semaphore};
+use tokio::{
+    sync::{watch, Semaphore},
+    task::JoinSet,
+};
 use tracing::{info, warn};
 
 pub async fn run_worker(
@@ -15,26 +18,28 @@ pub async fn run_worker(
     concurrency: usize,
     lease_ms: u64,
     poll_ms: u64,
+    shutdown_timeout_ms: u64,
 ) -> Result<()> {
     let client = Client::new(address);
     let slots = Arc::new(Semaphore::new(concurrency.max(1)));
-    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
-    let signal = tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
-        let _ = shutdown_tx.send(true);
-    });
+    let mut jobs = JoinSet::new();
+    let mut shutdown = std::pin::pin!(tokio::signal::ctrl_c());
     info!(worker_id, ?queues, concurrency, "worker started");
     loop {
-        if *shutdown_rx.borrow() {
-            break;
-        }
-        let permit =
-            tokio::select! {p=slots.clone().acquire_owned()=>p?,_=shutdown_rx.changed()=>break};
-        match client.lease(&worker_id, queues.clone(), lease_ms).await {
+        while jobs.try_join_next().is_some() {}
+        let permit = tokio::select! {
+            result = slots.clone().acquire_owned() => result?,
+            _ = &mut shutdown => break,
+        };
+        let lease = tokio::select! {
+            result = client.lease(&worker_id, queues.clone(), lease_ms) => result,
+            _ = &mut shutdown => { drop(permit); break; }
+        };
+        match lease {
             Ok(Some((job, token))) => {
                 let c = client.clone();
                 let w = worker_id.clone();
-                tokio::spawn(async move {
+                jobs.spawn(async move {
                     let _permit = permit;
                     let id = job.id.clone();
                     let (done_tx, mut done_rx) = watch::channel(false);
@@ -71,20 +76,51 @@ pub async fn run_worker(
             }
             Ok(None) => {
                 drop(permit);
-                tokio::time::sleep(Duration::from_millis(poll_ms.max(10))).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(poll_ms.max(10))) => {},
+                    _ = &mut shutdown => break,
+                }
             }
             Err(e) => {
                 drop(permit);
                 warn!(error=%e,"lease request failed");
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {},
+                    _ = &mut shutdown => break,
+                }
             }
         }
     }
-    drop(slots);
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    signal.abort();
-    info!(worker_id, "worker stopped");
+    slots.close();
+    let outstanding = jobs.len();
+    info!(
+        worker_id,
+        outstanding, shutdown_timeout_ms, "worker draining"
+    );
+    let drained = drain_jobs(&mut jobs, Duration::from_millis(shutdown_timeout_ms)).await;
+    if !drained {
+        warn!(
+            worker_id,
+            abandoned = jobs.len(),
+            "worker drain deadline exceeded; abandoning leases for expiry recovery"
+        );
+        jobs.abort_all();
+        while jobs.join_next().await.is_some() {}
+    }
+    info!(worker_id, drained, "worker stopped");
     Ok(())
+}
+
+async fn drain_jobs(jobs: &mut JoinSet<()>, timeout: Duration) -> bool {
+    tokio::time::timeout(timeout, async {
+        while let Some(result) = jobs.join_next().await {
+            if let Err(error) = result {
+                warn!(%error, "worker job task failed while draining");
+            }
+        }
+    })
+    .await
+    .is_ok()
 }
 
 // The reference worker deliberately has a tiny executor. Real applications use
@@ -106,5 +142,27 @@ async fn execute(payload: &Value) -> std::result::Result<(), String> {
             .to_string())
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn drain_waits_for_in_flight_tasks() {
+        let mut jobs = JoinSet::new();
+        jobs.spawn(async { tokio::time::sleep(Duration::from_millis(25)).await });
+        assert!(drain_jobs(&mut jobs, Duration::from_secs(1)).await);
+        assert!(jobs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn drain_respects_deadline() {
+        let mut jobs = JoinSet::new();
+        jobs.spawn(async { tokio::time::sleep(Duration::from_secs(10)).await });
+        assert!(!drain_jobs(&mut jobs, Duration::from_millis(10)).await);
+        assert_eq!(jobs.len(), 1);
+        jobs.abort_all();
     }
 }

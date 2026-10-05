@@ -76,7 +76,7 @@ On server restart, unfinished leases become `READY` immediately. Terminal jobs r
 
 ```text
 relay server --db relay.db --metrics-address 127.0.0.1:7401
-relay worker --queue email --queue notifications --concurrency 16
+relay worker --queue email --queue notifications --concurrency 16 --shutdown-timeout-ms 30000
 relay submit email --payload '{"user_id":42}' --priority high --retries 5
 relay inspect job_...
 relay stats
@@ -89,7 +89,7 @@ Use global `--address HOST:PORT` to select a server. Set `RUST_LOG=relay=debug` 
 
 ## Correctness and performance
 
-`cargo test --all-targets` covers competing claims, stale ACKs, lease expiry, retries to `DEAD`, delayed jobs, idempotency, and crash/restart recovery. `relay-bench --jobs 100000` measures local durable-submission throughput and latency percentiles. It prints measured results only; this repository does not publish unrepeatable numbers.
+`cargo test --all-targets` covers competing claims, concurrent idempotency, stale-token mutation attempts, renewal/expiry boundaries, lost ACKs, terminal-state invariants, retries to `DEAD`, delayed jobs, corruption detection, bounded shutdown, and 1,000-job crash/restart recovery. `relay-bench` measures disk-backed submission and lease+ACK throughput, latency percentiles, concurrency scaling, and peak RSS. Measured results and a profile-driven scheduler improvement are published in [benchmarking](docs/benchmarks.md).
 
 See [architecture](docs/architecture.md), [protocol](docs/protocol.md), [failure model](docs/failure-model.md), [design decisions](docs/design-decisions.md), and [benchmarking](docs/benchmarks.md).
 

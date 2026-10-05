@@ -26,6 +26,8 @@ pub enum StoreError {
     StaleLease,
     #[error("job not found")]
     NotFound,
+    #[error("persisted job {job_id} violates an invariant: {detail}")]
+    Corruption { job_id: String, detail: String },
     #[error("internal lock poisoned")]
     LockPoisoned,
 }
@@ -72,8 +74,8 @@ impl Store {
                 id TEXT PRIMARY KEY,
                 queue TEXT NOT NULL,
                 payload TEXT NOT NULL,
-                priority INTEGER NOT NULL,
-                state TEXT NOT NULL,
+                priority INTEGER NOT NULL CHECK(priority BETWEEN 0 AND 3),
+                state TEXT NOT NULL CHECK(state IN ('pending','ready','leased','succeeded','retrying','dead')),
                 attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
                 max_attempts INTEGER NOT NULL CHECK(max_attempts > 0),
                 created_at_ms INTEGER NOT NULL,
@@ -90,6 +92,7 @@ impl Store {
             );
             CREATE UNIQUE INDEX IF NOT EXISTS jobs_dedup_active ON jobs(queue, idempotency_key) WHERE idempotency_key IS NOT NULL;
             CREATE INDEX IF NOT EXISTS jobs_sched ON jobs(state, queue, available_at_ms, priority, created_at_ms);
+            CREATE INDEX IF NOT EXISTS jobs_ready_priority ON jobs(priority, created_at_ms, queue) WHERE state='ready';
             CREATE INDEX IF NOT EXISTS jobs_lease_expiry ON jobs(state, lease_expires_at_ms);")?;
         Ok(())
     }
@@ -170,19 +173,33 @@ impl Store {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         expire_and_promote(&tx, now)?;
         let placeholders = (0..queues.len())
-            .map(|i| format!("?{}", i + 2))
+            .map(|i| format!("?{}", i + 3))
             .collect::<Vec<_>>()
             .join(",");
-        // Aging adds one class per minute, capped at critical. FIFO breaks ties.
-        let sql = format!("SELECT id FROM jobs WHERE state='ready' AND available_at_ms<=?1 AND queue IN ({placeholders})
-            ORDER BY MIN(3, priority + ((?1-created_at_ms)/60000)) DESC, created_at_ms ASC LIMIT 1");
-        let id: Option<String> = {
-            let mut stmt = tx.prepare(&sql)?;
-            let mut values: Vec<rusqlite::types::Value> = vec![now.into()];
-            values.extend(queues.iter().cloned().map(Into::into));
-            stmt.query_row(rusqlite::params_from_iter(values), |r| r.get(0))
+        // Read only the oldest row in each priority class, then apply aging to
+        // four candidates. This preserves the scheduling rule without sorting
+        // the entire ready set for every claim.
+        let sql = format!("SELECT id,created_at_ms FROM jobs WHERE state='ready' AND priority=?2 AND queue IN ({placeholders}) ORDER BY created_at_ms ASC LIMIT 1");
+        let mut candidates = Vec::with_capacity(4);
+        for priority in 0_i64..=3 {
+            let candidate: Option<(String, i64)> = {
+                let mut stmt = tx.prepare_cached(&sql)?;
+                let mut values: Vec<rusqlite::types::Value> = vec![now.into(), priority.into()];
+                values.extend(queues.iter().cloned().map(Into::into));
+                stmt.query_row(rusqlite::params_from_iter(values), |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
                 .optional()?
-        };
+            };
+            if let Some((id, created_at)) = candidate {
+                let age_classes = now.saturating_sub(created_at) / 60_000;
+                candidates.push((id, (priority + age_classes).min(3), created_at));
+            }
+        }
+        let id = candidates
+            .into_iter()
+            .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.2.cmp(&a.2)))
+            .map(|c| c.0);
         let Some(id) = id else {
             tx.commit()?;
             return Ok(None);
@@ -333,7 +350,12 @@ impl Store {
                     dead: 0,
                 });
             }
-            let s = out.last_mut().expect("just inserted");
+            let Some(s) = out.last_mut() else {
+                return Err(StoreError::Corruption {
+                    job_id: format!("queue:{queue}"),
+                    detail: "aggregate row could not be assigned to a queue".into(),
+                });
+            };
             match state.as_str() {
                 "pending" => s.pending = count,
                 "ready" => s.ready = count,
@@ -341,7 +363,12 @@ impl Store {
                 "retrying" => s.retrying = count,
                 "succeeded" => s.succeeded = count,
                 "dead" => s.dead = count,
-                _ => {}
+                _ => {
+                    return Err(StoreError::Corruption {
+                        job_id: format!("queue:{queue}"),
+                        detail: format!("unknown aggregate state {state:?}"),
+                    })
+                }
             }
         }
         Ok(out)
@@ -360,12 +387,66 @@ fn expire_and_promote(tx: &rusqlite::Transaction<'_>, now: i64) -> Result<()> {
 }
 
 fn query_job(conn: &Connection, id: &str) -> Result<Option<Job>> {
-    conn.query_row("SELECT id,queue,payload,priority,state,attempts,max_attempts,created_at_ms,available_at_ms,lease_owner,lease_token,lease_expires_at_ms,last_error,retry_policy FROM jobs WHERE id=?1", [id], |r| {
-        let payload: String = r.get(2)?;
-        let state: String = r.get(4)?;
-        let policy: String = r.get(13)?;
-        Ok(Job { id:r.get(0)?, queue:r.get(1)?, payload:serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null), priority:Priority::from_value(r.get(3)?), state:JobState::from_str(&state).unwrap_or(JobState::Dead), attempts:r.get(5)?, max_attempts:r.get(6)?, created_at_ms:r.get(7)?, available_at_ms:r.get(8)?, lease_owner:r.get(9)?, lease_token:r.get(10)?, lease_expires_at_ms:r.get(11)?, last_error:r.get(12)?, retry_policy:serde_json::from_str(&policy).unwrap_or_default() })
-    }).optional().map_err(Into::into)
+    struct RawJob {
+        id: String,
+        queue: String,
+        payload: String,
+        priority: i64,
+        state: String,
+        attempts: u32,
+        max_attempts: u32,
+        created_at_ms: i64,
+        available_at_ms: i64,
+        lease_owner: Option<String>,
+        lease_token: Option<String>,
+        lease_expires_at_ms: Option<i64>,
+        last_error: Option<String>,
+        retry_policy: String,
+    }
+    let raw = conn.query_row("SELECT id,queue,payload,priority,state,attempts,max_attempts,created_at_ms,available_at_ms,lease_owner,lease_token,lease_expires_at_ms,last_error,retry_policy FROM jobs WHERE id=?1", [id], |r| {
+        Ok(RawJob { id:r.get(0)?, queue:r.get(1)?, payload:r.get(2)?, priority:r.get(3)?, state:r.get(4)?, attempts:r.get(5)?, max_attempts:r.get(6)?, created_at_ms:r.get(7)?, available_at_ms:r.get(8)?, lease_owner:r.get(9)?, lease_token:r.get(10)?, lease_expires_at_ms:r.get(11)?, last_error:r.get(12)?, retry_policy:r.get(13)? })
+    }).optional()?;
+    let Some(raw) = raw else { return Ok(None) };
+    let corrupt = |detail: String| StoreError::Corruption {
+        job_id: raw.id.clone(),
+        detail,
+    };
+    let payload = serde_json::from_str(&raw.payload)
+        .map_err(|e| corrupt(format!("invalid payload JSON: {e}")))?;
+    let priority = Priority::try_from_value(raw.priority).map_err(corrupt)?;
+    let state = JobState::from_str(&raw.state).map_err(corrupt)?;
+    let retry_policy = serde_json::from_str(&raw.retry_policy)
+        .map_err(|e| corrupt(format!("invalid retry policy JSON: {e}")))?;
+    let lease_fields = (
+        raw.lease_owner.is_some(),
+        raw.lease_token.is_some(),
+        raw.lease_expires_at_ms.is_some(),
+    );
+    if (state == JobState::Leased) != (lease_fields == (true, true, true)) {
+        return Err(corrupt("lease fields do not match job state".into()));
+    }
+    if raw.attempts > raw.max_attempts {
+        return Err(corrupt(format!(
+            "attempts {} exceed max_attempts {}",
+            raw.attempts, raw.max_attempts
+        )));
+    }
+    Ok(Some(Job {
+        id: raw.id,
+        queue: raw.queue,
+        payload,
+        priority,
+        state,
+        attempts: raw.attempts,
+        max_attempts: raw.max_attempts,
+        created_at_ms: raw.created_at_ms,
+        available_at_ms: raw.available_at_ms,
+        lease_owner: raw.lease_owner,
+        lease_token: raw.lease_token,
+        lease_expires_at_ms: raw.lease_expires_at_ms,
+        last_error: raw.last_error,
+        retry_policy,
+    }))
 }
 
 fn now_ms() -> i64 {
@@ -436,6 +517,84 @@ mod tests {
         for expected in [JobState::Retrying, JobState::Dead] {
             let (_, t) = s.lease("w", &["default".into()], 1000).unwrap().unwrap();
             assert_eq!(s.fail(&id, "w", &t, "boom").unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn corrupt_payload_is_reported_not_replaced() {
+        let s = Store::memory().unwrap();
+        let (id, _) = s.submit(job()).unwrap();
+        s.connection()
+            .unwrap()
+            .execute("UPDATE jobs SET payload='not-json' WHERE id=?1", [&id])
+            .unwrap();
+        assert!(matches!(s.inspect(&id), Err(StoreError::Corruption { .. })));
+    }
+
+    #[test]
+    fn corrupt_state_is_reported_not_mapped_to_dead() {
+        let s = Store::memory().unwrap();
+        let (id, _) = s.submit(job()).unwrap();
+        let conn = s.connection().unwrap();
+        conn.execute_batch("PRAGMA ignore_check_constraints=ON")
+            .unwrap();
+        conn.execute("UPDATE jobs SET state='impossible' WHERE id=?1", [&id])
+            .unwrap();
+        drop(conn);
+        assert!(matches!(s.inspect(&id), Err(StoreError::Corruption { .. })));
+    }
+
+    #[test]
+    fn indexed_scheduler_preserves_priority_aging() {
+        let s = Store::memory().unwrap();
+        let mut low = job();
+        low.priority = Priority::Low;
+        let (low_id, _) = s.submit(low).unwrap();
+        s.connection()
+            .unwrap()
+            .execute(
+                "UPDATE jobs SET created_at_ms=created_at_ms-300000 WHERE id=?1",
+                [&low_id],
+            )
+            .unwrap();
+        let mut high = job();
+        high.priority = Priority::High;
+        s.submit(high).unwrap();
+        let (leased, _) = s
+            .lease("worker", &["default".into()], 1_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(leased.id, low_id, "aged low-priority work must not starve");
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn arbitrary_operations_preserve_core_invariants(operations in proptest::collection::vec(0u8..6, 1..100)) {
+            let s = Store::memory().unwrap();
+            let mut submitted = job();
+            submitted.max_attempts = 3;
+            let (id, _) = s.submit(submitted).unwrap();
+            let mut current_token: Option<String> = None;
+            let mut previous_attempts = 0;
+            for operation in operations {
+                match operation {
+                    0 => if let Ok(Some((_, token))) = s.lease("worker", &["default".into()], 1_000) { current_token = Some(token); },
+                    1 => { let _ = s.ack(&id, "stale", "stale-token"); },
+                    2 => { let _ = s.fail(&id, "stale", "stale-token", "late"); },
+                    3 => if let Some(token) = current_token.take() { let _ = s.ack(&id, "worker", &token); },
+                    4 => if let Some(token) = current_token.take() { let _ = s.fail(&id, "worker", &token, "retry"); },
+                    _ => { let _ = s.promote(); },
+                }
+                let persisted = s.inspect(&id).unwrap().unwrap();
+                proptest::prop_assert!(persisted.attempts >= previous_attempts);
+                proptest::prop_assert!(persisted.attempts <= persisted.max_attempts);
+                let all_lease_fields = persisted.lease_owner.is_some() && persisted.lease_token.is_some() && persisted.lease_expires_at_ms.is_some();
+                proptest::prop_assert_eq!(persisted.state == JobState::Leased, all_lease_fields);
+                if persisted.state.is_terminal() {
+                    proptest::prop_assert!(s.lease("other", &["default".into()], 1_000).unwrap().is_none());
+                }
+                previous_attempts = persisted.attempts;
+            }
         }
     }
 }
