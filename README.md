@@ -33,17 +33,25 @@ The server deliberately uses one SQLite writer protected by a mutex. Claims run 
 ## Job lifecycle
 
 ```mermaid
-stateDiagram-v2
-    [*] --> Pending: delayed submit
-    [*] --> Ready: immediate submit
-    Pending --> Ready: available_at reached
-    Ready --> Leased: transactional claim; attempts++
-    Leased --> Succeeded: valid ACK
-    Leased --> Ready: lease expires / restart
-    Leased --> Retrying: failure; attempts remain
-    Retrying --> Ready: backoff elapsed
-    Leased --> Dead: attempts exhausted
-    Dead --> Ready: operator retry
+flowchart TB
+    Submit{Job submitted}
+    Pending[Pending]
+    Ready[Ready]
+    Leased[Leased]
+    Retrying[Retrying]
+    Succeeded[Succeeded]
+    Dead[Dead]
+
+    Submit -->|Delayed| Pending
+    Submit -->|Available now| Ready
+    Pending -->|Schedule reached| Ready
+    Ready -->|Transactional claim and attempt increment| Leased
+    Leased -->|Valid ACK| Succeeded
+    Leased -->|Lease expires or server restarts| Ready
+    Leased -->|Failure with attempts remaining| Retrying
+    Retrying -->|Backoff elapsed| Ready
+    Leased -->|Attempts exhausted| Dead
+    Dead -->|Operator retry| Ready
 ```
 
 Every lease carries a random fencing token. ACK, failure, and renewal require the job ID, worker ID, current token, and an unexpired lease. A worker returning after reassignment cannot mutate the new owner's job.
