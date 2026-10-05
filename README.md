@@ -43,15 +43,15 @@ flowchart TB
     Dead[Dead]
 
     Submit -->|Delayed| Pending
-    Submit -->|Available now| Ready
-    Pending -->|Schedule reached| Ready
-    Ready -->|Transactional claim and attempt increment| Leased
-    Leased -->|Valid ACK| Succeeded
-    Leased -->|Lease expires or server restarts| Ready
-    Leased -->|Failure with attempts remaining| Retrying
-    Retrying -->|Backoff elapsed| Ready
-    Leased -->|Attempts exhausted| Dead
-    Dead -->|Operator retry| Ready
+    Submit -->|Immediate| Ready
+    Pending -->|Due| Ready
+    Ready -->|Claim + increment| Leased
+    Leased -->|ACK| Succeeded
+    Leased -->|Lease lost| Ready
+    Leased -->|Retryable failure| Retrying
+    Retrying -->|Retry due| Ready
+    Leased -->|Exhausted| Dead
+    Dead -->|Replay| Ready
 ```
 
 Every lease carries a random fencing token. ACK, failure, and renewal require the job ID, worker ID, current token, and an unexpired lease. A worker returning after reassignment cannot mutate the new owner's job.
